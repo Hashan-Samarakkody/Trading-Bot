@@ -1,0 +1,542 @@
+# RL Trading Arena — Project Report
+
+**INTE 42222 · Reinforcement Learning**
+
+Written for: the module marker. Assumes the lecture series as shared context;
+every design choice below is traced to a specific lecture result, and every
+number is reproducible from a script in `experiments/`.
+
+---
+
+## 0. Summary
+
+| Phase | Algorithm | Score | Baseline | Reference points |
+|---|---|---|---|---|
+| 1 — bandit | Discounted UCB | **1.456** | random 0.338 | best *fixed* arm 0.560; oracle 2.356 |
+| 2 — MDP | Tuned Q-learning | **0.0389** | untuned Q-learning 0.0279 | return 0.0565, drawdown 0.0352 |
+
+Phase 1 reaches 61.8 % of the oracle ceiling and 2.60× the best fixed arm.
+Phase 2 is 1.39× the bundled baseline — though §4.4 shows that the *choice*
+between Q-learning and SARSA is not statistically supported at this sample size. Runtimes are 0.1 s and 2.0 s against
+budgets of 30 s and 90 s.
+
+The result I would most want read is not either score. It is Section 5: three
+predictions derived correctly from lecture results were **falsified by
+measurement**, and the reasons why are more interesting than the scores.
+
+---
+
+## 1. Establishing what the problem is worth
+
+Before choosing an algorithm I measured the environment, because without a
+ceiling a score is uninterpretable.
+
+`experiments/IM07_arm_ev.py` reads the phase schedule out of
+`bandit_env._regime_weights()` and then samples each arm 40 000 times inside
+each phase.
+
+**Phase schedule** (`epoch_length = 20`, `total_pulls = 200`):
+
+| Pulls | Phase | Regime mix | Best arm |
+|---|---|---|---|
+| 0–79 | bull-heavy | 0.85 / 0.05 / 0.10 | `buy_hold` |
+| 80–139 | choppy | 0.05 / 0.05 / 0.90 | `mean_reversion` |
+| 140–199 | bear-heavy | 0.05 / 0.85 / 0.10 | `stay_cash` |
+
+Two switches, at pull **80** and pull **140**. The middle regime lasts only 60
+pulls, which sets a hard requirement: any forgetting mechanism must react
+within roughly 10–15 pulls or it spends a quarter of each regime on a stale arm.
+
+**Measured per-pull expected reward:**
+
+| Phase | `momentum` | `mean_reversion` | `buy_hold` | `stay_cash` | `random` |
+|---|---|---|---|---|---|
+| 0 bull | +0.0147 | +0.0039 | **+0.0187** | 0.0000 | +0.0092 |
+| 1 choppy | −0.0131 | **+0.0143** | +0.0016 | 0.0000 | +0.0008 |
+| 2 bear | −0.0043 | −0.0128 | −0.0172 | **0.0000** | −0.0088 |
+
+**Ceilings over one 200-pull replicate:**
+
+- Oracle (always on the phase-best arm): **2.356**
+- Best *fixed* arm (`buy_hold`): **0.560**
+- Published random baseline: 0.338
+
+best-fixed / oracle = **23.8 %**, which independently confirms the spec's claim
+that the best fixed arm earns "roughly a quarter" of what a tracking agent can.
+
+> **The most consequential finding of this section.** A hardcoded `buy_hold`
+> scores 0.560 — well above the 0.338 random baseline everyone is told to beat.
+> So beating 0.338 demonstrates nothing; it does not even prove the agent is
+> adaptive. The real bar is 0.560, and I added it as an explicit release gate.
+
+---
+
+## 2. Phase 1 — algorithm selection
+
+### 2.1 Ruling things out with Lecture 6
+
+Lecture 6 ranks five exploration principles. Three are eliminated by this
+environment rather than by preference:
+
+| Principle | Algorithm | Regret | Fate here |
+|---|---|---|---|
+| 1 naive | fixed ε-greedy | linear | the 0.207 baseline; its sample means never forget |
+| 2 optimistic init | high `Q₀` | linear, cheap | optimism dies after one sweep; cannot revive a written-off arm |
+| 3 optimism under uncertainty | UCB1 | logarithmic | **basis of the submission** |
+| 4 probability matching | Thompson | logarithmic, optimal | implemented for comparison (§2.4) |
+| 5 information state | Gittins | Bayes-optimal | intractable; discussion only |
+
+Lecture 6 gives the exact reason fixed ε-greedy fails — the per-step regret
+floor `lₜ ≥ (ε/|A|)·Σ Δₐ`, which never decays — and that is visible in the
+bundled baseline scoring 0.207, *below* random.
+
+Decaying ε (GLIE) is also rejected, for a reason specific to this problem: GLIE
+converges **on purpose** to a single fixed optimum. Here the optimum moves
+twice per run, so convergence is precisely the failure mode.
+
+### 2.2 Why UCB, then modified
+
+UCB1 is the right starting point because of a property Lecture 6 states
+explicitly: `log t` in the bonus numerator lifts every arm's bonus over time, so
+"an arm ignored for a long time slowly becomes attractive again — UCB never
+permanently writes anything off." That is exactly what surviving a regime
+switch requires, and it is already in the algorithm.
+
+What UCB1 gets wrong here is memory: `Q̂(a)` is a **lifetime** sample mean and
+`N(a)` a lifetime count, so bull-phase evidence still outvotes the bear phase
+100 pulls later. Two lecture results license the fix:
+
+- **Lecture 4**, *Constant-α Monte-Carlo: choosing to forget* — a constant step
+  size gives an exponentially weighted average. The lecture's stated motivation
+  is that "if the environment drifts, then old returns were generated by a
+  world that no longer exists. Forgetting is a feature."
+- **Lecture 5**, Robbins-Monro — constant α fails `Σαₜ² < ∞`, "but it also never
+  forgets how to adapt, which is why it is preferred in non-stationary
+  problems."
+
+So the submitted agent keeps UCB's optimism and replaces its lifetime
+statistics with discounted ones.
+
+### 2.3 Two design decisions worth defending
+
+**(a) Counts decay globally, on every pull — not only for the selected arm.**
+If a neglected arm's count were frozen, its evidence would stay stale forever,
+which is the pathology the discounting exists to remove. Global decay shrinks
+an unsampled arm's effective count, grows its bonus, and brings it back — UCB's
+revival property, operating on a regime-relevant timescale.
+
+**(b) The exploration constant must be rescaled.** Lecture 6 derives
+`Uₜ(a) = √(2 log t / Nₜ(a))` from Hoeffding's inequality, which assumes rewards
+in `[0,1]`. Rewards here are weekly returns of order ±0.03. Using `c = √2`
+unscaled makes the bonus roughly two orders of magnitude larger than any
+difference between arms, and the agent degenerates to round-robin — which would
+*still* beat the ε-greedy baseline. That is the kind of accident that looks like
+success and is not.
+
+Final parameters: `α = 0.15`, `γ_d = 0.99`, `c = 0.01`.
+
+### 2.4 Principle 3 vs principle 4, measured
+
+`experiments/IM07_thompson_bandit.py` implements discounted Gaussian Thompson
+sampling. A Gaussian posterior is used rather than the lecture's Beta-Bernoulli
+because rewards are signed reals, not wins and losses. The posterior is
+discounted for the reason Lecture 6 itself names: "a confident wrong prior can
+suppress the best arm for a long time" — and after a regime switch, yesterday's
+*correct* posterior **is** a confident wrong prior.
+
+| Agent | Principle | Scored seeds | Held-out (40 seeds) | Worst held-out |
+|---|---|---|---|---|
+| Random | — | 0.474 | 0.294 | −0.623 |
+| ε-greedy fixed | 1 | 0.269 | 0.401 | −0.259 |
+| **Discounted UCB** | 3 | **1.456** | **1.302** | **0.228** |
+| Discounted Thompson | 4 | 1.121 | 0.840 | −0.130 |
+
+**The lecture's ordering reverses.** Lecture 6 rates Thompson *above* UCB in the
+stationary case — it attains the Lai–Robbins bound, UCB only matches its order.
+Here UCB wins on both mean and worst case.
+
+My hypothesis: Thompson's advantage is asymptotic, and 200 pulls split across
+three regimes gives roughly 60–80 pulls per regime — far from asymptotic. Worse,
+Thompson's exploration is *stochastic*: it explores when a posterior draw
+happens to come out high. UCB's is *deterministic*: a decayed count
+mechanically guarantees a retry. When the budget before the next regime change
+is this short, a guaranteed retry beats a probabilistic one.
+
+**Caveat I want to state plainly:** UCB's three parameters were swept and
+Thompson's were not. Part of this gap is tuning effort, not algorithmic merit.
+The honest claim is that UCB wins *as configured*, not that principle 3 beats
+principle 4 in general.
+
+### 2.5 Proof of adaptation, not luck
+
+A score cannot distinguish an adaptive agent from a lucky one. Lecture 6's
+regret decomposition says what to look at instead:
+
+> `Lₜ = Σₐ E[Nₜ(a)] · Δₐ` — regret is counts times gaps, so "a good algorithm
+> ensures small counts for large gaps."
+
+`N(a)` is directly observable. `experiments/IM07_arm_counts.py` buckets a run
+into 20-pull epochs (averaged over the 5 scored seeds):
+
+| Pulls | Phase | `momentum` | `mean_rev` | `buy_hold` | `stay_cash` | `random` | Modal |
+|---|---|---|---|---|---|---|---|
+| 0–19 | bull | 4.0 | 3.2 | **8.4** | 2.0 | 2.4 | `buy_hold` ✓ |
+| 20–39 | bull | 6.0 | 1.0 | **9.6** | 0.8 | 2.6 | `buy_hold` ✓ |
+| 40–59 | bull | 2.6 | 2.4 | **13.0** | 1.2 | 0.8 | `buy_hold` ✓ |
+| 60–79 | bull | **8.6** | 1.4 | 7.8 | 1.0 | 1.2 | `momentum` |
+| 80–99 | choppy | 3.8 | **8.6** | 1.4 | 1.6 | 4.6 | `mean_reversion` ✓ |
+| 100–119 | choppy | 1.4 | **12.4** | 1.8 | 3.8 | 0.6 | `mean_reversion` ✓ |
+| 120–139 | choppy | 2.4 | **9.0** | 1.6 | 7.0 | 0.0 | `mean_reversion` ✓ |
+| 140–159 | bear | 4.6 | 1.8 | 0.2 | **13.2** | 0.2 | `stay_cash` ✓ |
+| 160–179 | bear | 1.8 | 0.8 | 1.2 | **16.0** | 0.2 | `stay_cash` ✓ |
+| 180–199 | bear | 3.0 | 0.4 | 1.0 | **13.0** | 2.6 | `stay_cash` ✓ |
+
+The modal arm changes at exactly pulls 80 and 140 — the measured boundaries.
+
+The one "miss", epoch 60–79 drifting to `momentum`, is **correct behaviour**
+under the regret decomposition. `momentum`'s gap in the bull phase is only
+0.0187 − 0.0147 = 0.004, the smallest non-zero gap in the game. The agent is
+spending exploration on a cheap arm while having abandoned `buy_hold` in the
+bear phase, where the gap is 0.0172 — four times larger. Small counts on large
+gaps, exactly as prescribed.
+
+---
+
+## 3. Phase 2 — control
+
+### 3.1 Why the bundled baseline scores only ≈0.03
+
+`QLearningReferenceAgent` uses fixed ε = 0.1, fixed α = 0.1, γ = 0.95, no decay.
+In lecture terms: fixed ε is not GLIE and carries a regret floor; γ = 0.95 has
+an effective horizon of 1/(1−γ) = 20 steps against a 60-day episode; and `Q₀ = 0`
+provides no systematic exploration at all.
+
+Those three diagnoses are correct. Two of the three *fixes* they imply turned
+out to be wrong — see Section 5.
+
+### 3.2 The environment is mostly noise
+
+`experiments/IM07_diagnose_mdp.py` measured the reward stream:
+
+```
+per-step reward : mean -0.000403,  sd 0.014172
+signal-to-noise : approximately 1 : 35
+plausible |Q|   : ~0.008 at gamma=0.95,  ~0.024 at gamma=0.99
+```
+
+This single measurement explains nearly every subsequent result. It is
+Lecture 4's bias/variance trade-off in its most extreme form: with the signal
+buried 35× under the noise, anything that accumulates more noise per update
+loses, even when it reduces bias.
+
+### 3.3 Final configuration
+
+`γ = 0.95`, `α = 0.05`, `ε: 0.5 → 0.10`, `Q₀ = 0.03`, Q-learning.
+
+Tuned on seeds 200000–200049 — a block disjoint from both the training seeds
+(0–299) and the graded seeds (100000–100049). The graded block was scored
+**once**, at the end. This applies the spec's own train/held-out discipline one
+level up, to the hyperparameters.
+
+---
+
+## 4. Q-learning vs SARSA
+
+### 4.1 The prediction
+
+Lecture 5's cliff walking: Q-learning learns `q*`, the optimal edge-hugging
+path, but *behaves* ε-greedily and falls off; SARSA evaluates the policy it
+actually follows, so it learns the edge is dangerous **for it** and keeps its
+distance. "Reward while learning: SARSA wins. Policy learned: Q-learning wins."
+
+This project is the same situation with two forces pulling opposite ways:
+
+- The score is `mean_return − 0.5 × mean_max_drawdown`. It explicitly **pays**
+  for the risk-aversion SARSA learns. → favours SARSA.
+- But the harness calls `set_eval_mode(True)`, zeroing ε before scoring. The
+  exploration that made SARSA cautious is switched off at the moment it would
+  be tested. → favours Q-learning.
+
+So the outcome is a genuine empirical question, not a known result.
+
+### 4.2 Verifying SARSA is actually SARSA first
+
+Lecture 5 names a specific trap: "choosing A′ twice. If you re-sample the next
+action at the top of the following iteration, the value you bootstrapped from
+is not the action you took, and the algorithm **silently** stops being SARSA."
+
+Silently is the problem — a broken SARSA still trains, still scores, and still
+looks like SARSA in a report. `experiments/IM07_test_sarsa_correctness.py`
+instruments both agents and asserts the property:
+
+| Agent | A′ bootstrapped == action taken | Required |
+|---|---|---|
+| `SarsaAgent` | 59/59 = 100 % | must be 100 % |
+| `SarsaLambdaAgent` | 59/59 = 100 % | must be 100 % |
+| `QLearningAgent` | 0/0 — keeps no pending action | must **not** be 100 % |
+
+The negative case matters as much as the positive: a test that passed for both
+would be testing nothing.
+
+### 4.3 Result, on the graded seeds
+
+| Variant | Return | Drawdown | **Score** |
+|---|---|---|---|
+| **Q-learning** | 0.0565 | 0.0352 | **0.0389** |
+| SARSA | 0.0523 | 0.0334 | 0.0357 |
+| SARSA(λ=0.5) | 0.0523 | 0.0334 | 0.0357 |
+| baseline | 0.0442 | 0.0326 | 0.0279 |
+
+**SARSA does learn the more cautious policy, exactly as predicted** — its
+drawdown is lower (0.0334 vs 0.0352). The cliff-walking intuition transfers,
+and this is the part of the prediction I am confident in.
+
+### 4.4 The ranking, however, is not statistically established
+
+The score ordering above is **not** a real result, and I want to be explicit
+about that rather than bank the win.
+
+Two observations forced the retraction:
+
+1. When all variants are given the *same* tuned hyperparameters (rather than
+   each its own validation-selected set), the ordering **flips**: SARSA 0.0396
+   vs Q-learning 0.0389. Selection on 50 validation episodes is evidently
+   noisier than the gap it is selecting on.
+2. Re-scoring both agents over **400** held-out episodes instead of 50:
+
+| Variant | Mean score | sd | standard error |
+|---|---|---|---|
+| Q-learning | +0.0273 | 0.0974 | 0.0049 |
+| SARSA | +0.0270 | 0.0965 | 0.0048 |
+
+Paired difference (Q − SARSA) = **+0.0003**, se 0.0022, **paired t = 0.13** —
+nowhere near significance. The per-episode standard deviation (≈0.097) is more
+than twice the mean score itself, so 50 episodes gives a standard error of
+roughly 0.014 — about **twenty times** the true difference between the two
+algorithms.
+
+**Conclusion.** On this environment, with this training budget, Q-learning and
+SARSA are indistinguishable on risk-adjusted score. The 0.0389 vs 0.0357 gap
+reported by the sweep is sampling noise, and any claim built on it would be
+unsupported.
+
+What *does* survive: SARSA reliably produces the lower-drawdown policy, which
+is the mechanism Lecture 5 predicts. The drawdown difference is a property of
+the learned policy; the score difference is not.
+
+Lecture 5's closing note — "turn ε down over time and Q-learning wins on both
+counts" — remains the right explanation for *why* SARSA's caution does not
+convert into score here: `set_eval_mode(True)` zeroes ε, so SARSA pays the
+premium for caution during training and is then scored under conditions where
+that caution earns nothing. But "does not convert into an advantage" is as far
+as the data supports; it does not reach "Q-learning wins".
+
+### 4.5 SARSA(λ): a diagnosis that looked like a bug
+
+SARSA(λ) initially returned **exactly 0.0000** — never taking a position. An
+exact zero is a bug signature, so I inspected the table rather than tuning.
+
+It was not a bug. The agent had learned `flat` in 19 of 30 states with a healthy
+action spread of 1.1 × 10⁻², i.e. a confident, genuinely over-cautious policy.
+Accumulating eligibility traces multiply the effective step size — the same α
+that is stable for one-step SARSA over-corrects when the error is broadcast to
+every trace-bearing cell. With α = 0.05 and λ = 0.5 it matches plain SARSA.
+
+Worth recording because the failure mode is indistinguishable from a bug by
+score alone, and the policy inspection is what separated them.
+
+---
+
+## 5. Where lecture-derived predictions were falsified
+
+This is the section I would most want weighted. Four predictions were derived
+correctly from lecture results and then contradicted by measurement.
+
+### 5.1 γ = 0.99 lost to γ = 0.95
+
+**Predicted** from Lecture 2: γ near 1 is far-sighted; 1/(1−0.99) = 100 steps
+covers the whole 60-day episode, whereas 1/(1−0.95) = 20 truncates it.
+
+**Measured:** γ = 0.95 is better.
+
+**Why.** The Lecture 2 argument is entirely about **bias** and silent about
+**variance**. At 1:35 signal-to-noise, a longer bootstrap horizon accumulates
+noise faster than it accumulates signal. Lecture 4's bias/variance trade-off
+decides a question Lecture 2 appeared to own. Neither lecture is wrong; I
+applied the one that did not govern.
+
+### 5.2 GLIE decay to ε ≈ 0.01 lost to a floor of ε = 0.10
+
+**Predicted** from Lecture 5: GLIE requires the policy to become greedy in the
+limit, so decay ε toward zero.
+
+**Measured:** stopping the decay at 0.10 — the untuned baseline's own fixed
+level — is better.
+
+**Why.** Both GLIE conditions are **asymptotic**. Here there are 300 episodes
+for a 90-cell table under heavy noise, nowhere near the limit. Going near-greedy
+early does not converge on anything; it freezes whatever noise the table happens
+to hold. The lecture result is correct and simply does not bind at this budget.
+GLIE condition (b) is still satisfied at scoring time — the harness sets ε = 0.
+
+### 5.3 The optimistic initialisation was rescaled the wrong way
+
+Lecture 6 prescribes `Q₀ = r_max/(1−γ)`. I correctly recognised the formula
+assumes a `[0,1]` reward scale, and then rescaled it to `q_init = 0.01` — which
+is **below** the measured plausible |Q| of 0.024 at γ = 0.99. That is
+pessimistic initialisation, the opposite of what was intended, and it silently
+removed the systematic sweep the technique exists to provide.
+
+Fix: measure plausible |Q| first, then sit just above it — `Q₀ = 0.03`.
+
+### 5.4 The best fixed arm was underestimated
+
+I estimated ≈0.3 by hand; it is 0.560. This mattered more than the arithmetic
+error suggests, because 0.560 > the 0.338 baseline everyone is told to beat. Had
+I not measured it, a mediocre agent scoring 0.45 would have looked like a
+success while being beaten by one hardcoded line.
+
+**The transferable lesson:** a lecture formula carries its reward scale and its
+asymptotic regime as *hidden assumptions*. Both must be checked against the
+environment before the formula is applied. Three of the four failures above are
+instances of that single mistake.
+
+---
+
+## 6. Generalisation: training vs held-out
+
+Measured by `experiments/IM07_compare_mdp.py`, scoring each trained agent on 50
+training seeds (0–49) and the 50 disjoint graded seeds (100000–100049):
+
+| Variant | Train score | Held-out score | Gap |
+|---|---|---|---|
+| baseline | 0.0034 | 0.0279 | −0.0245 |
+| Q-learning (first attempt) | 0.0052 | 0.0240 | −0.0188 |
+| SARSA (first attempt) | −0.0096 | −0.0022 | −0.0074 |
+
+**Every gap is negative** — every agent performs *better* on seeds it never
+trained on. This is the opposite of overfitting, and it needs explaining rather
+than celebrating.
+
+The explanation is that the training seeds are not a memorised set in any useful
+sense. With 30 states, 3 actions and 300 episodes of a stochastic,
+regime-switching price process, a given (state, action) pair is visited under
+many different regimes across many different seeds. The Q-table cannot encode
+seed-specific structure because the state contains no seed-identifying
+information — momentum bucket, volatility bucket and position are all
+regime-level summaries. There is nothing to overfit *to*.
+
+The negative sign itself is then just sampling variation between two blocks of
+50 episodes: the held-out block happens to contain slightly more favourable
+price paths. This is confirmed by the baseline showing the same −0.0245 gap
+despite having no tuning at all.
+
+**What this means for the spec's question.** The held-out score is trustworthy
+here, but *not* because the agent generalises well in an interesting sense — it
+is because the state representation is too coarse to memorise anything. A
+genuine overfitting risk in this project lives one level up, in the
+hyperparameters, which is why those were tuned on a third disjoint seed block
+(200000+) and the graded block was touched exactly once.
+
+Phase 1 received the same treatment. Re-validating the swept parameters on 40
+unseen seeds:
+
+| Config | In-sample | Held-out | Gap | Worst held-out |
+|---|---|---|---|---|
+| **α=0.15, γ_d=0.99, c=0.01** | **1.456** | **1.302** | +0.154 | 0.228 |
+| α=0.10, γ_d=1.00, c=0.02 | 1.280 | 1.315 | −0.035 | 0.284 |
+| α=0.10, γ_d=1.00, **c=0** | 1.106 | **1.442** | −0.336 | **−0.097** |
+
+The `c = 0` row is the interesting one. No exploration bonus at all — greedy on
+discounted value estimates — gives the **best held-out mean of all**, 1.442. It
+was rejected because its worst seed is −0.097.
+
+That is Lecture 6's two-doors failure appearing in my own measurements: without
+a bonus, one unlucky early sample can silence an arm for the remainder of the
+run. It happens rarely, so the mean looks excellent; when it happens the run is
+destroyed. Reporting the worst seed alongside the mean is the only reason it was
+caught, and it is why the submitted agent keeps `c > 0` despite a lower average.
+
+---
+
+## 7. Reflection on leaderboard placement
+
+**What helped most, in order.**
+
+1. **Measuring the ceiling before writing an agent.** The oracle (2.356) and
+   best-fixed-arm (0.560) numbers converted the score from an arbitrary figure
+   into a fraction of what is achievable, and exposed that the advertised 0.338
+   bar was far too low.
+2. **Forgetting, not exploring.** The single largest Phase 1 gain came from
+   replacing UCB1's lifetime sample mean with a constant-α estimate. Exploration
+   strategy mattered much less than memory length.
+3. **Diagnosing before tuning.** The first Phase 2 attempt scored *below* the
+   baseline. Inspecting the Q-tables and the reward scale located three distinct
+   causes; a blind hyperparameter sweep would have papered over all of them and
+   taught nothing.
+4. **Reporting worst-case, not just mean.** This is what rejected the fragile
+   `c = 0` configuration.
+
+**What hurt.**
+
+1. **Trusting derivations over measurement.** γ, ε and `Q₀` were all set from
+   sound lecture reasoning and all three were wrong. The reasoning was not
+   faulty; the hidden assumptions were.
+2. **Tuning budget asymmetry.** UCB was swept across 125 configurations,
+   Thompson across none. The §2.4 comparison is correspondingly weakened, and I
+   have flagged it rather than presenting it as a clean algorithmic result.
+
+**Honest limitations.**
+
+- Phase 1 reaches 61.8 % of oracle. The remaining 38 % is mostly switch-detection
+  lag — roughly 10–15 pulls after each of the two boundaries. An explicit
+  change-point detector would likely close part of that, but it is not a
+  Lecture 6 technique and I chose to stay within the course material.
+- SARSA(λ) was tuned over a smaller grid than the one-step methods and matched
+  rather than beat plain SARSA. I would not claim traces are useless here, only
+  that I did not find a configuration where they help.
+- All Phase 2 *leaderboard* scores rest on 50 evaluation episodes, and §4.4 shows
+  that is far too few to separate the variants: per-episode sd is 0.097 against a
+  mean of 0.027, giving a standard error around 0.014 on a true difference of
+  0.0003. I tested this rather than assuming it, and retracted the ranking
+  accordingly. The submitted agent is Q-learning because it is simpler to
+  justify, not because it was shown to be better.
+
+---
+
+## 8. Reproducing every number
+
+```
+python eval_harness.py                                  # baseline reference table
+python experiments/IM07_arm_ev.py                       # §1 EVs, ceilings, boundaries
+python experiments/IM07_sweep_bandit.py                 # §2.3 parameter sweep
+python experiments/IM07_holdout_bandit.py               # §6 out-of-sample check
+python experiments/IM07_arm_counts.py                   # §2.5 regime tracking
+python experiments/IM07_thompson_bandit.py              # §2.4 UCB vs Thompson
+python experiments/IM07_test_sarsa_correctness.py       # §4.2 on-policy assertion
+python experiments/IM07_diagnose_mdp.py                 # §3.2 noise + Q-table inspection
+python experiments/IM07_sweep_mdp.py                    # §3.3 validation-seed sweep
+python experiments/IM07_compare_mdp.py                  # §4.3, §6 comparison + gaps
+
+python experiments/IM07_plots.py                        # figures 1-4
+
+python test_locally.py IM07_agent_bandit.py bandit      # final Phase 1 score
+python test_locally.py IM07_agent_mdp.py mdp            # final Phase 2 score
+```
+
+`notebooks/IM07_analysis.ipynb` walks the same evidence end to end with the four
+figures rendered inline. It imports the submitted modules rather than restating
+them, so what it analyses is exactly what is submitted; the agents themselves stay
+as `.py` files because `submit_agent.py` reads a submission as source text and
+`test_locally.py` imports it as a module -- a notebook cannot be submitted. Run it
+with:
+
+```
+jupyter nbconvert --to notebook --execute --inplace notebooks/IM07_analysis.ipynb
+```
+
+## 9. Outstanding work
+
+- **Leaderboard submission.** Nothing has been submitted yet; `submit_agent.py`
+  needs the server URL from the instructor.
+- An equal-budget Thompson sweep, to make §2.4 a fair algorithmic comparison.
