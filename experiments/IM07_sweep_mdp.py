@@ -1,6 +1,5 @@
 """
 sweep_mdp.py  --  Task T7b (owner: R4, design by R1)
-====================================================
 
 Phase 2 hyperparameter search, with one methodological rule:
 

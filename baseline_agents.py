@@ -13,9 +13,7 @@ import numpy as np
 from agent_base import BanditAgent, MDPAgent
 
 
-# --------------------------------------------------------------------- #
 # Phase 1 baselines
-# --------------------------------------------------------------------- #
 class RandomBanditAgent(BanditAgent):
     def __init__(self, n_arms):
         super().__init__(n_arms)
@@ -49,9 +47,9 @@ class EpsilonGreedyBanditAgent(BanditAgent):
         self.values[arm] += (reward - self.values[arm]) / n
 
 
-# --------------------------------------------------------------------- #
+ 
 # Phase 2 baselines
-# --------------------------------------------------------------------- #
+ 
 class RandomMDPAgent(MDPAgent):
     def __init__(self, n_states, n_actions):
         super().__init__(n_states, n_actions)

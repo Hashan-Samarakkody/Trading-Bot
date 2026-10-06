@@ -1,6 +1,5 @@
 """
 sweep_bandit.py  --  Task T5 (owner: R4 Experimental Scientist)
-==============================================================
 
 Sweeps the three discounted-UCB parameters over the 5 fixed evaluation
 seeds and reports MEAN and PER-SEED SPREAD, not the mean alone.

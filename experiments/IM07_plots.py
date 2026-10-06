@@ -1,6 +1,5 @@
 """
 IM07_plots.py  --  Task T11 (owner: R4 Experimental Scientist)
-=============================================================
 
 Renders the figures the specification requires in the final report:
 

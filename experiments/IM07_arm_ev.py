@@ -1,6 +1,5 @@
 """
 arm_ev.py  --  Tasks T1 / T2 (owner: R2 Quant Analyst, verified by R4)
-=====================================================================
 
 Before choosing a bandit algorithm we need to know what the game is worth.
 This script answers three questions empirically, so that nothing in the

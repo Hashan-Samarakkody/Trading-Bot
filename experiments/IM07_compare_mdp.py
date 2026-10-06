@@ -1,6 +1,6 @@
 """
 compare_mdp.py  --  Task T10, gates V6 / V7 (owner: R4 Experimental Scientist)
-=============================================================================
+ =======
 
 The required SARSA-vs-Q-learning comparison, plus the train/held-out
 generalisation measurement.

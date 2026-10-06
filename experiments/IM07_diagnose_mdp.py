@@ -1,6 +1,5 @@
 """
 diagnose_mdp.py  --  diagnosis for the V6 failure (owner: R1 + R3)
-=================================================================
 
 compare_mdp.py showed three things that need explaining before any tuning:
 

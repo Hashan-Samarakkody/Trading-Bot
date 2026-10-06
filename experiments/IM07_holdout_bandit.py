@@ -1,6 +1,5 @@
 """
 holdout_bandit.py  --  Task T5b (owner: R4 Experimental Scientist)
-=================================================================
 
 experiments/IM07_sweep_bandit.py tuned three parameters on exactly the 5 seeds
 the harness scores. That is a legitimate thing to do -- those are the seeds

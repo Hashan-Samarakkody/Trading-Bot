@@ -1,6 +1,5 @@
 """
 test_sarsa_correctness.py  --  gate V5 (owner: R3 Engineer)
-===========================================================
 
 Lecture 5 names one specific bug by name:
 

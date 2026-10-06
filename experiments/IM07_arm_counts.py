@@ -1,6 +1,6 @@
 """
 arm_counts.py  --  Task T11 / gate V3 (owner: R4 Experimental Scientist)
-=======================================================================
+ =
 
 The single most important Phase 1 figure.
 

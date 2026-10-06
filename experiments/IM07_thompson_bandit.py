@@ -1,6 +1,5 @@
 """
 IM07_thompson_bandit.py  --  Task T6 (owner: R3, design by R1)
-==============================================================
 
 Lecture 6's principle 4 (probability matching), implemented as a discounted
 Gaussian Thompson sampler, so the report can compare principles 3 and 4 on

@@ -1,6 +1,6 @@
 """
 agent_bandit.py  --  Phase 1 submission (non-stationary 5-armed bandit)
-======================================================================
+ 
 
 Algorithm: DISCOUNTED UCB  (Lecture 6 principle 3 + Lecture 4/5 forgetting)
 
